@@ -23,9 +23,13 @@ class AppleMusicDiscordRPC {
     public readonly defaultTimeout: number,
   ) {
     this.previousState = "stopped"; // Start with status "stopped"
+    this.previousTrack = ""; // Start with empty track
+    this.previousPosition = 0; // Start with position at 0
   }
 
   private previousState: string;
+  private previousTrack: string;
+  private previousPosition: number;
 
   async run(): Promise<void> {
     while (true) {
@@ -80,100 +84,119 @@ class AppleMusicDiscordRPC {
 
     if (!open) {
       await this.rpc.clearActivity();
+      this.previousTrack = ""; // Reset track info
+      this.previousPosition = 0; // Reset position
       return this.defaultTimeout;
     }
 
     const state = await getMusicState(this.appName);
     console.log("state:", state);
 
-    const previousState = this.previousState;
+    // Detect state changes
+    const stateChanged = state !== this.previousState;
     this.previousState = state;
-    const justStartedPlaying = (previousState !== "playing" && state === "playing");
 
-    switch (state) {
-      case "playing": {
-        const props = await getMusicProps(this.appName);
-        console.log("props:", props);
+    if (state === "playing") {
+      const props = await getMusicProps(this.appName);
+      console.log("props:", props);
 
-        let delta, start, end;
-        if (props.duration) {
-          delta = (props.duration - props.playerPosition) * 1000;
-          end = Math.ceil(Date.now() + delta);
-          start = Math.ceil(Date.now() - props.playerPosition * 1000);
-        }
+      // Create a unique identifier for the current track
+      const currentTrack = `${props.artist} - ${props.name}`;
+      
+      // Check if track has changed
+      const trackChanged = currentTrack !== this.previousTrack && this.previousTrack !== "";
+      this.previousTrack = currentTrack;
+      
+      // Check if the playback position has significantly changed (manual seeking)
+      const positionJumped = Math.abs(props.playerPosition - this.previousPosition) > 3 
+                             && this.previousPosition > 0;
+      this.previousPosition = props.playerPosition;
 
-        // EVERYTHING must be less than or equal to 128 chars long
-        const activity: Activity = {
-          // @ts-ignore: "listening to" is allowed in recent Discord versions
-          type: 2,
-          details: AppleMusicDiscordRPC.ensureValidStringLength(props.name),
-          timestamps: { start, end },
-          assets: { large_image: "appicon" },
-        };
+      // Detect any significant changes that require fast updating
+      const needsFastUpdate = stateChanged || trackChanged || positionJumped;
 
-        if (props.artist) {
-          activity.state = AppleMusicDiscordRPC.ensureValidStringLength(
-            props.artist,
-          );
-        }
+      let delta, start, end;
+      if (props.duration) {
+        delta = (props.duration - props.playerPosition) * 1000;
+        end = Math.ceil(Date.now() + delta);
+        start = Math.ceil(Date.now() - props.playerPosition * 1000);
+      }
 
-        if (props.album) {
-          const infos = await this.cachedTrackExtras(props);
-          console.log("infos:", infos);
+      // EVERYTHING must be less than or equal to 128 chars long
+      const activity: Activity = {
+        // @ts-ignore: "listening to" is allowed in recent Discord versions
+        type: 2,
+        details: AppleMusicDiscordRPC.ensureValidStringLength(props.name),
+        timestamps: { start, end },
+        assets: { large_image: "appicon" },
+      };
 
-          activity.assets = {
-            large_image: infos.artworkUrl ?? "appicon",
-            large_text: AppleMusicDiscordRPC.ensureValidStringLength(
-              props.album,
-            ),
-          };
-
-          const buttons = [];
-
-          if (infos.iTunesUrl) {
-            buttons.push({
-              label: "Play on Apple Music",
-              url: infos.iTunesUrl,
-            });
-          }
-
-          const query = encodeURIComponent(
-            `artist:${props.artist} track:${props.name}`,
-          );
-          const spotifyUrl = `https://open.spotify.com/search/${query}?si`;
-          if (spotifyUrl.length <= 512) {
-            buttons.push({
-              label: "Search on Spotify",
-              url: spotifyUrl,
-            });
-          }
-
-          if (buttons.length > 0) {
-            activity.buttons = buttons;
-          }
-        }
-
-        await this.rpc.setActivity(activity);
-        
-        if (justStartedPlaying) {
-          console.log("Just started playing, checking again soon...");
-          return 500; // Überprüfe erneut in 500ms für schnellere Updates
-        }
-        
-        return Math.min(
-          (delta ?? this.defaultTimeout) + 1000,
-          this.defaultTimeout,
+      if (props.artist) {
+        activity.state = AppleMusicDiscordRPC.ensureValidStringLength(
+          props.artist,
         );
       }
 
-      case "paused":
-      case "stopped": {
-        await this.rpc.clearActivity();
-        return this.defaultTimeout;
+      if (props.album) {
+        const infos = await this.cachedTrackExtras(props);
+        console.log("infos:", infos);
+
+        activity.assets = {
+          large_image: infos.artworkUrl ?? "appicon",
+          large_text: AppleMusicDiscordRPC.ensureValidStringLength(
+            props.album,
+          ),
+        };
+
+        const buttons = [];
+
+        if (infos.iTunesUrl) {
+          buttons.push({
+            label: "Play on Apple Music",
+            url: infos.iTunesUrl,
+          });
+        }
+
+        const query = encodeURIComponent(
+          `artist:${props.artist} track:${props.name}`,
+        );
+        const spotifyUrl = `https://open.spotify.com/search/${query}?si`;
+        if (spotifyUrl.length <= 512) {
+          buttons.push({
+            label: "Search on Spotify",
+            url: spotifyUrl,
+          });
+        }
+
+        if (buttons.length > 0) {
+          activity.buttons = buttons;
+        }
       }
 
-      default:
-        throw new Error(`Unknown state: ${state}`);
+      await this.rpc.setActivity(activity);
+      
+      if (needsFastUpdate) {
+        console.log("Playback changed, checking again soon...");
+        return 500; // Check again in 500ms for faster updates
+      }
+      
+      return Math.min(
+        (delta ?? this.defaultTimeout) + 1000,
+        this.defaultTimeout,
+      );
+    } else { // paused or stopped
+      await this.rpc.clearActivity();
+      
+      // Reset track position but keep track info for change detection
+      this.previousPosition = 0;
+      
+      // If state just changed to paused/stopped, check again soon
+      if (stateChanged) {
+        console.log("Playback paused/stopped, checking again soon...");
+        return 500;
+      }
+      
+      return this.defaultTimeout;
     }
   }
 
@@ -353,22 +376,30 @@ async function musicBrainzArtwork({
   });
 
   const resp = await fetch(`https://musicbrainz.org/ws/2/release?${params}`);
-  const json = (await resp.json()) as MBReleaseLookupResponse;
+  try {
+    const json = (await resp.json()) as MBReleaseLookupResponse;
 
-  for (const release of json.releases) {
-    const resp = await fetch(
-      `https://coverartarchive.org/release/${release.id}/front`,
-      { method: "HEAD" },
-    );
-    await resp.body?.cancel();
-    if (resp.ok) {
-      return resp.url;
+    for (const release of json.releases) {
+      const coverResp = await fetch(
+        `https://coverartarchive.org/release/${release.id}/front`,
+        { method: "HEAD" },
+      );
+      await coverResp.body?.cancel();
+      if (coverResp.ok) {
+        return coverResp.url;
+      }
     }
+  } catch (error) {
+    console.error("Error fetching MusicBrainz artwork:", error);
+  } finally {
+    resp.body?.cancel();
   }
+  
+  return undefined;
 }
 
 function luceneEscape(term: string): string {
-  return term.replace(/([+\-&|!(){}\[\]^"~*?:\\])/g, "\\$1");
+  return term.replace(/([+\-&|!(){}\[\]^"~*?:\\\/])/g, "\\$1");
 }
 
 function removeParenthesesContent(term: string): string {
