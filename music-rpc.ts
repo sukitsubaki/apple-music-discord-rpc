@@ -21,7 +21,11 @@ class AppleMusicDiscordRPC {
     public readonly rpc: Client,
     public readonly kv: Deno.Kv,
     public readonly defaultTimeout: number,
-  ) {}
+  ) {
+    this.previousState = "stopped"; // Start with status "stopped"
+  }
+
+  private previousState: string;
 
   async run(): Promise<void> {
     while (true) {
@@ -81,6 +85,10 @@ class AppleMusicDiscordRPC {
 
     const state = await getMusicState(this.appName);
     console.log("state:", state);
+
+    const previousState = this.previousState;
+    this.previousState = state;
+    const justStartedPlaying = (previousState !== "playing" && state === "playing");
 
     switch (state) {
       case "playing": {
@@ -146,6 +154,12 @@ class AppleMusicDiscordRPC {
         }
 
         await this.rpc.setActivity(activity);
+        
+        if (justStartedPlaying) {
+          console.log("Just started playing, checking again soon...");
+          return 500; // Überprüfe erneut in 500ms für schnellere Updates
+        }
+        
         return Math.min(
           (delta ?? this.defaultTimeout) + 1000,
           this.defaultTimeout,
